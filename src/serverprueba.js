@@ -51,6 +51,34 @@ function writeLog(prefix, text) {
 }
 
 /**
+ * Log simple por device: logs/motorlockstatus-<deviceID>-YYYY-MM-DD.log
+ * Cada linea -> fecha | cadena | valor de motorlockStatus
+ */
+function logMotorlock(buffer) {
+  try {
+    let cadena;
+    let deviceID = 'desconocido';
+    let motorlockStatus = 'N/A';
+    if (buffer[0] === 0x24) {
+      cadena = buffer.toString('hex').toUpperCase();
+      try {
+        const d = parseBinaryPacket(buffer);
+        deviceID = d.deviceID;
+        motorlockStatus = d.motorlockStatus;
+      } catch (e) {}
+    } else {
+      cadena = buffer.toString('ascii').trim();
+      const p = cadena.replace(/[()\r\n]/g, '').trim().split(',').map(x => x.trim());
+      deviceID = (p[0] === 'P45' || p[0] === 'P43' || p[0] === 'P69') ? p[1] : p[0];
+    }
+    const safe = String(deviceID || 'desconocido').replace(/[^A-Za-z0-9_-]/g, '') || 'desconocido';
+    writeLog(`motorlockstatus-${safe}`, `${now()} | ${cadena} | motorlockStatus=${motorlockStatus}`);
+  } catch (err) {
+    console.error('[LOG motorlock]', err.message);
+  }
+}
+
+/**
  * Convierte caracteres no imprimibles a punto
  * para poder visualizar mejor el contenido.
  */
@@ -332,6 +360,8 @@ REMOTE : ${remote}
         remote,
         buffer
       );
+
+      logMotorlock(buffer);
 
       /**
        * Mostramos cada byte individualmente.

@@ -1,5 +1,7 @@
 require('dotenv').config();
 const net = require('net');
+const fs = require('fs');
+const path = require('path');
 const pool = require('./db/pool');
 const { parseBinaryPacket } = require('./protocol/binary');
 const { parseP45 } = require('./protocol/p45');
@@ -10,6 +12,42 @@ const HOST = process.env.TCP_HOST || '0.0.0.0';
 const PORT = Number(process.env.TCP_PORT || 11000);
 const TIMEOUT = Number(process.env.SOCKET_TIMEOUT_MS || 300000);
 const LOG_RAW = String(process.env.LOG_RAW || 'true').toLowerCase() === 'true';
+
+// Log simple por device: logs/motorlockstatus-<deviceID>.log
+// Cada linea -> fecha | cadena | valor de motorlockStatus
+function motorlockLogFile(deviceID) {
+  const safe = String(deviceID || 'desconocido').replace(/[^A-Za-z0-9_-]/g, '') || 'desconocido';
+  return path.join(__dirname, `../logs/motorlockstatus-${safe}.log`);
+}
+
+function deviceIdFromAscii(text) {
+  const p = text.replace(/[()\r\n]/g, '').trim().split(',').map(x => x.trim());
+  return (p[0] === 'P45' || p[0] === 'P43' || p[0] === 'P69') ? p[1] : p[0];
+}
+
+function logMotorlock(buffer) {
+  try {
+    let cadena;
+    let deviceID = 'desconocido';
+    let motorlockStatus = 'N/A';
+    if (buffer[0] === 0x24) {
+      cadena = buffer.toString('hex').toUpperCase();
+      try {
+        const d = parseBinaryPacket(buffer);
+        deviceID = d.deviceID;
+        motorlockStatus = d.motorlockStatus;
+      } catch (e) {}
+    } else {
+      cadena = buffer.toString('ascii').trim();
+      deviceID = deviceIdFromAscii(cadena);
+    }
+    const file = motorlockLogFile(deviceID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${new Date().toISOString()} | ${cadena} | motorlockStatus=${motorlockStatus}\n`);
+  } catch (err) {
+    console.error('[LOG motorlock]', err.message);
+  }
+}
 
 function looksAscii(buffer) {
   const s = buffer.toString('ascii');
@@ -59,6 +97,7 @@ const server = net.createServer(socket => {
 
   socket.on('data', async buffer => {
     try {
+      logMotorlock(buffer);
       if (LOG_RAW) console.log(`[RAW ${remote}] ${buffer.toString('hex').toUpperCase()}`);
       if (looksAscii(buffer)) {
         await processAscii(socket, buffer.toString('ascii'));
