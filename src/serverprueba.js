@@ -6,10 +6,14 @@ const path = require('path');
 
 const { parseBinaryPacket } = require('./protocol/binary');
 const { parseP45 } = require('./protocol/p45');
+const { FrameAccumulator } = require('./protocol/framer');
 
 const HOST = process.env.TCP_HOST || '0.0.0.0';
 const PORT = Number(process.env.TCP_PORT || 11000);
 const TIMEOUT = Number(process.env.SOCKET_TIMEOUT_MS || 300000);
+// Longitud fija de la trama binaria (1 byte 0x24 + 61 de payload). Se puede
+// sobreescribir con BINARY_FRAME_LEN si un firmware usara otro tamano.
+const BINARY_FRAME_LEN = Number(process.env.BINARY_FRAME_LEN || 62);
 
 const LOG_DIR = path.join(__dirname, '../logs');
 
@@ -94,20 +98,9 @@ function printableAscii(buffer) {
     .join('');
 }
 
-/**
- * Detecta si parece mensaje ASCII
- */
-function looksAscii(buffer) {
-  const text = buffer.toString('ascii');
-
-  return (
-    text.includes('P43') ||
-    text.includes('P45') ||
-    text.includes('P69') ||
-    text.includes('P46') ||
-    text.startsWith('(')
-  );
-}
+// Nota: la deteccion de protocolo por heuristica de texto (looksAscii) se
+// reemplazo por el reensamblador (framer): el tipo lo decide el primer byte
+// de cada trama completa (0x24 = binaria, 0x28 '(' = ASCII).
 
 /**
  * Imprime un bloque completo con toda
@@ -311,9 +304,39 @@ ${err.stack}
 }
 
 /**
+ * Respuesta al equipo, replicando el bytecode del listener Java:
+ *   - Trama binaria 0x24  -> (P69,0,<ultimo byte del paquete>)\r\n
+ *   - Trama ASCII  P45    -> (P69,0,<campo 16 = serialnumber>)\r\n
+ *   - Trama ASCII  P43    -> no responde nada
+ *   - Otro                -> no responde nada
+ * Devuelve el string a escribir en el socket, o null si no hay que responder.
+ */
+function buildAck(frame) {
+  try {
+    if (frame.type === 'binary') {
+      const serial = frame.buffer[frame.buffer.length - 1];
+      return `(P69,0,${serial})\r\n`;
+    }
+
+    const text = frame.text || frame.buffer.toString('ascii');
+    if (text.includes('P45')) {
+      const parts = text.replace(/[()\r\n]/g, '').split(',').map(x => x.trim());
+      const serial = parts.length >= 17 ? parts[16] : '0';
+      return `(P69,0,${serial})\r\n`;
+    }
+
+    return null; // P43 y demas: el Java no contesta
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
  * Servidor TCP
  */
 const server = net.createServer(socket => {
+
+  const acc = new FrameAccumulator(BINARY_FRAME_LEN);
 
   const remote =
     `${socket.remoteAddress}:${socket.remotePort}`;
@@ -361,10 +384,8 @@ REMOTE : ${remote}
         buffer
       );
 
-      logMotorlock(buffer);
-
       /**
-       * Mostramos cada byte individualmente.
+       * Mostramos cada byte individualmente (del chunk crudo).
        */
       console.log('\n[BYTES INDIVIDUALES]');
 
@@ -389,47 +410,44 @@ REMOTE : ${remote}
       );
 
       /**
-       * Detectamos protocolo
+       * Reensamblamos: el chunk TCP puede traer media trama o varias pegadas.
+       * acc.push() devuelve solo las tramas COMPLETAS.
        */
-      if (looksAscii(buffer)) {
+      const frames = acc.push(buffer);
 
-        console.log('\nTIPO DETECTADO: ASCII');
+      if (frames.length === 0) {
+        console.log('\n[FRAMER] Aun no hay trama completa, esperando mas bytes');
+        writeLog('framer', `${now()} | ${remote} | parcial, sin trama completa | +${buffer.length}B`);
+      }
 
-        await processAscii(
-          socket,
-          buffer,
-          remote
-        );
+      for (const frame of frames) {
 
-      } else if (
-        buffer.length > 0 &&
-        buffer[0] === 0x24
-      ) {
+        console.log(`\n[FRAMER] trama completa: ${frame.type} (${frame.buffer.length} bytes)`);
+        writeLog('framer', `${now()} | ${remote} | ${frame.type} | ${frame.buffer.toString('hex').toUpperCase()}`);
 
-        console.log('\nTIPO DETECTADO: BINARIO JT701');
+        logMotorlock(frame.buffer);
 
-        await processBinary(
-          socket,
-          buffer,
-          remote
-        );
+        if (frame.type === 'ascii') {
+          console.log('\nTIPO DETECTADO: ASCII');
+          await processAscii(socket, frame.buffer, remote);
+        } else {
+          console.log('\nTIPO DETECTADO: BINARIO JT701');
+          await processBinary(socket, frame.buffer, remote);
+        }
 
-      } else {
-
-        console.warn(
-          '\n[WARN] TIPO DE TRAMA DESCONOCIDA'
-        );
-
-        writeLog(
-          'unknown',
-          `
-${now()}
-REMOTE: ${remote}
-BYTES: ${buffer.length}
-HEX: ${buffer.toString('hex').toUpperCase()}
-ASCII: ${printableAscii(buffer)}
-`
-        );
+        /**
+         * Respuesta al equipo, igual que el Java. serverprueba NO toca la BD,
+         * pero si contesta para que el dispositivo deje de reenviar la trama.
+         */
+        const ack = buildAck(frame);
+        if (ack) {
+          socket.write(ack);
+          console.log(`[ACK -> ${remote}] ${ack.trim()}`);
+          writeLog('ack', `${now()} | ${remote} | ${frame.type} | ${ack.trim()}`);
+        } else {
+          console.log(`[ACK -> ${remote}] (sin respuesta, igual que el Java)`);
+          writeLog('ack', `${now()} | ${remote} | ${frame.type} | (sin respuesta)`);
+        }
       }
 
     } catch (err) {
